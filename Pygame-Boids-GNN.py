@@ -7,6 +7,12 @@ import struct
 import os
 from config import *
 
+# If run_experiment.py (or anyone else) set a seed via config, seed here --
+# before any boids/predators/obstacles are created -- so a stored run's
+# config_used.json is enough to reproduce the exact dataset (same spawn
+# positions/velocities, same wander drift, everything).
+if RANDOM_SEED is not None:
+    random.seed(RANDOM_SEED)
 
 
 CSV_FIELDS = [

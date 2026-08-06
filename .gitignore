@@ -1,3 +1,35 @@
-boids_log.bin
-boids_log.csv
+# --- Python ---
 __pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+
+# --- Generated simulation data ---
+# Every dataset (config.json/config.txt + boids_log_N.csv/.bin) is fully
+# regenerable from run_experiment.py / Experiments.py -- the csv/bin files
+# in particular can get large (37500 steps x ~36+ entities per step), so
+# they aren't worth versioning. Keep the Data/ folder itself in the repo,
+# but ignore everything generated inside it.
+Data/*
+!Data/.gitkeep
+
+# If you'd rather keep specific datasets in version control (e.g. a
+# reference dataset used in a paper/report), whitelist them explicitly:
+# !Data/dataset_1/
