@@ -46,13 +46,15 @@ import subprocess
 import sys
 import time
 
-#run python Experiment.py --add Data/dataset_# if you want more of the same data set
-
+#run Python Experiments.py --add Data/dataset_# to run the same configuration again
+#run Python Experiments.py --set Name=value to give it a specific constraint
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 MAIN_PY = os.path.join(PROJECT_ROOT, "Pygame-Boids-GNN.py")
 DATA_DIR = os.path.join(PROJECT_ROOT, "Data")
 
+#About 1 minute
 DEFAULT_STEPS = 3600
+
 
 # Ranges are hand-picked around the defaults already in config.py so
 # randomized runs stay "sensible" instead of producing a degenerate sim
@@ -91,14 +93,95 @@ CHOICE_RANGES = {
 }
 
 
-def sample_config():
+# Derived parameters aren't sampled from a fixed range -- they're computed
+# relative to another sampled value (see sample_config below). They can
+# still be pinned exactly with --set, just not narrowed with --range.
+DERIVED_FLOAT_PARAMS = {"BOIDS_MAX_SPEED", "BOIDS_PREDATOR_MAX_SPEED"}
+DERIVED_INT_PARAMS = {"BOIDS_COHESION_RADIUS", "BOIDS_ALIGNMENT_RADIUS"}
+
+ALL_FLOAT_PARAMS = set(FLOAT_RANGES) | DERIVED_FLOAT_PARAMS
+ALL_INT_PARAMS = set(INT_RANGES) | DERIVED_INT_PARAMS
+ALL_PARAM_NAMES = ALL_FLOAT_PARAMS | ALL_INT_PARAMS | set(CHOICE_RANGES)
+
+
+def normalize_param_name(name):
+    name = name.strip().upper()
+    if not name.startswith("BOIDS_"):
+        name = "BOIDS_" + name
+    return name
+
+
+def coerce_set_value(name, raw):
+    """Turn a --set NAME=VALUE string into the right Python type for NAME."""
+    if name in ALL_FLOAT_PARAMS:
+        return float(raw)
+    if name in ALL_INT_PARAMS:
+        return int(float(raw))
+    if name == "BOIDS_BORDER_MODE":
+        if raw not in ("wrap", "bounded"):
+            sys.exit(f"--set BORDER_MODE must be 'wrap' or 'bounded', got: {raw}")
+        return raw
+    if name == "BOIDS_WAYPOINT_LOOP":
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    sys.exit(f"Unknown parameter for --set: {name}\nKnown parameters: "
+              f"{', '.join(sorted(p.replace('BOIDS_', '') for p in ALL_PARAM_NAMES))}")
+
+
+def parse_set_args(pairs):
+    overrides = {}
+    for pair in pairs:
+        if "=" not in pair:
+            sys.exit(f"--set expects NAME=VALUE, got: {pair}")
+        name, raw = pair.split("=", 1)
+        name = normalize_param_name(name)
+        overrides[name] = coerce_set_value(name, raw)
+    return overrides
+
+
+def parse_range_args(pairs):
+    """--range only applies to independently-sampled params (FLOAT_RANGES /
+    INT_RANGES) -- not the derived ones, and not the choice params (use
+    --set for those instead)."""
+    overrides = {}
+    for pair in pairs:
+        if "=" not in pair:
+            sys.exit(f"--range expects NAME=LOW,HIGH, got: {pair}")
+        name, rng = pair.split("=", 1)
+        name = normalize_param_name(name)
+        if "," not in rng:
+            sys.exit(f"--range expects NAME=LOW,HIGH, got: {pair}")
+        lo, hi = rng.split(",", 1)
+        if name in FLOAT_RANGES:
+            overrides[name] = (float(lo), float(hi))
+        elif name in INT_RANGES:
+            overrides[name] = (int(float(lo)), int(float(hi)))
+        else:
+            sys.exit(
+                f"--range doesn't apply to {name.replace('BOIDS_', '')} "
+                f"(either it's a derived value -- use --set to pin it -- or "
+                f"a wrap/bounded-style choice -- use --set for that too).\n"
+                f"Rangeable parameters: "
+                f"{', '.join(sorted(p.replace('BOIDS_', '') for p in (set(FLOAT_RANGES) | set(INT_RANGES))))}"
+            )
+    return overrides
+
+
+def sample_config(range_overrides=None, set_overrides=None):
     """Sample every randomizable parameter, respecting the dependent
-    relationships the simulation actually relies on."""
+    relationships the simulation actually relies on. `range_overrides`
+    narrows/widens the sampling bounds for specific params; `set_overrides`
+    pins params to an exact value afterward (skipping randomization for
+    those entirely)."""
+    range_overrides = range_overrides or {}
+    set_overrides = set_overrides or {}
     cfg = {}
 
-    for name, (lo, hi) in FLOAT_RANGES.items():
+    float_ranges = {**FLOAT_RANGES, **{k: v for k, v in range_overrides.items() if k in FLOAT_RANGES}}
+    int_ranges = {**INT_RANGES, **{k: v for k, v in range_overrides.items() if k in INT_RANGES}}
+
+    for name, (lo, hi) in float_ranges.items():
         cfg[name] = round(random.uniform(lo, hi), 5)
-    for name, (lo, hi) in INT_RANGES.items():
+    for name, (lo, hi) in int_ranges.items():
         cfg[name] = random.randint(lo, hi)
     for name, choices in CHOICE_RANGES.items():
         cfg[name] = random.choice(choices)
@@ -116,6 +199,14 @@ def sample_config():
 
     pred_min = cfg["BOIDS_PREDATOR_MIN_SPEED"]
     cfg["BOIDS_PREDATOR_MAX_SPEED"] = round(random.uniform(pred_min + 1.0, pred_min + 3.0), 3)
+
+    # Pins applied last, so a --set value always wins regardless of any
+    # relationship logic above (e.g. --set MAX_SPEED=4 overrides whatever
+    # the min-speed-relative sampling above would have produced).
+    for name, value in set_overrides.items():
+        if name not in ALL_PARAM_NAMES:
+            sys.exit(f"Unknown parameter for --set: {name}")
+        cfg[name] = value
 
     return cfg
 
@@ -220,7 +311,18 @@ def main():
                          help=f"Steps to record (default: {DEFAULT_STEPS})")
     parser.add_argument("--show", action="store_true",
                          help="Open the pygame window instead of running headless")
+    parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                         help="Pin a parameter to an exact value instead of randomizing it "
+                              "(repeatable). Example: --set NUM_PREDATORS=2 --set BORDER_MODE=wrap")
+    parser.add_argument("--range", dest="ranges", action="append", default=[], metavar="NAME=LOW,HIGH",
+                         help="Narrow/widen the sampling range for a parameter (repeatable, "
+                              "only for new datasets, not --add). "
+                              "Example: --range COHESION_WEIGHT=0.001,0.0015")
     args = parser.parse_args()
+
+    if args.add and (args.set or args.ranges):
+        sys.exit("--set/--range only apply when creating a new dataset, not with --add "
+                  "(--add always reuses the dataset's existing stored config).")
 
     if args.add:
         dataset_dir = os.path.abspath(args.add)
@@ -231,7 +333,9 @@ def main():
             cfg = json.load(f)["config"]
         run_number = next_run_number(dataset_dir)
     else:
-        cfg = sample_config()
+        set_overrides = parse_set_args(args.set)
+        range_overrides = parse_range_args(args.ranges)
+        cfg = sample_config(range_overrides=range_overrides, set_overrides=set_overrides)
         dataset_dir = next_dataset_dir()
         os.makedirs(dataset_dir, exist_ok=True)
         write_config_files(dataset_dir, cfg)
