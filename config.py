@@ -35,6 +35,28 @@ LEADER_WANDER_FORCE = 0.12      # how strongly the wander heading pulls a leader
 LEADER_COLOR = (255, 210, 60)
 FOLLOWER_COLOR = (100, 200, 255)
 # ==========================================================
+# Waypoints
+# ==========================================================
+# Numbered goal spots that leaders navigate through, in order. Followers
+# aren't pulled toward waypoints directly -- they just follow the nearest
+# leader as before, so the whole flock ends up tracing the route as the
+# leaders lead it there. Each leader tracks its own progress along this
+# list independently (self.waypoint_index), so leaders don't have to be
+# in lockstep with each other.
+WAYPOINTS = [
+    (150, 100),
+    (750, 120),
+    (750, 550),
+    (150, 550),
+    (450, 325),
+]
+WAYPOINT_RADIUS = 40         # how close a leader must get to count as "arrived"
+WAYPOINT_WEIGHT = 0.01       # how strongly a leader steers toward its current waypoint
+WAYPOINT_LOOP = True         # once the last waypoint is reached, start over at 0; if
+                              # False, a leader just holds at the final waypoint's id
+WAYPOINT_COLOR = (120, 230, 140)
+WAYPOINT_RING_COLOR = (70, 140, 85)
+# ==========================================================
 # Predator
 # ==========================================================
 NUM_PREDATORS = 1
@@ -73,6 +95,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CSV_PATH = os.path.join(SCRIPT_DIR, "boids_log.csv")
 BIN_PATH = os.path.join(SCRIPT_DIR, "boids_log.bin")
+OBSTACLE_RADIUS = 40
 # How many simulation steps to record. Recording starts at step 0 and stops
 # automatically once this many steps have been logged (steps only advance
 # while unpaused, so pausing does not count against this budget).

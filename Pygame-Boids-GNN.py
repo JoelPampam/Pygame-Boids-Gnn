@@ -11,25 +11,39 @@ from config import *
 
 CSV_FIELDS = [
     "step", "entity_type", "entity_id", "x", "y", "x_vel", "y_vel",
-    "pre_planned", "is_leader", "leader_id",
+    "pre_planned", "is_leader", "leader_id", "waypoint_id",
     "separation", "cohesion", "alignment", "predator_avoid",
+    "obstacle_avoid", "obstacle_contact",
+    "radius", "event",
     "border_mode",
 ]
+# "radius" and "event" are only populated for entity_type == "obstacle"
+# rows (event is "created" or "removed"); they're blank everywhere else.
+# Obstacles aren't static like waypoints and don't have a fixed count, so
+# rather than re-logging every obstacle's position every step, each one
+# gets exactly two rows -- a "created" row and (if it's ever removed) a
+# "removed" row. The active obstacle set at any given step can be
+# reconstructed from those intervals, filtered by entity_id.
 
 # ---------------------------------------------------------------------------
-# Binary format (little-endian), one record per entity (boid or predator)
-# per step:
+# Binary format (little-endian), one record per entity (boid, predator, or
+# obstacle) -- this mirrors the CSV field-for-field:
 #
 #   uint32   step
-#   uint8    entity_type            (0 = boid, 1 = predator)
+#   uint8    entity_type            (0 = boid, 1 = predator, 2 = obstacle)
 #   uint32   entity_id
 #   float32  x
 #   float32  y
 #   float32  x_vel
 #   float32  y_vel
 #   uint8    pre_planned            (0 or 1)
-#   uint8    is_leader              (0 or 1, always 0 for predators)
+#   uint8    is_leader              (0 or 1, always 0 for predators/obstacles)
 #   int32    leader_id              (-1 if not following a leader / not a boid)
+#   int32    waypoint_id            (numbered goal spot currently being pursued:
+#                                    a leader's own index into WAYPOINTS, or the
+#                                    waypoint_id of the leader a follower is
+#                                    currently following; -1 if not applicable /
+#                                    not currently attached to a leader)
 #   uint8    border_mode            (0 = wrap, 1 = bounded)
 #   uint16   separation_count
 #   uint32[] separation_ids         (separation_count entries)
@@ -39,34 +53,63 @@ CSV_FIELDS = [
 #   uint32[] alignment_ids
 #   uint16   predator_avoid_count
 #   uint32[] predator_avoid_ids
+#   uint16   obstacle_avoid_count     (obstacles currently within soft
+#                                      avoidance range -- radius + 30)
+#   uint32[] obstacle_avoid_ids
+#   uint16   obstacle_contact_count   (obstacles currently in hard contact /
+#                                      overlap -- boids only, always 0 for
+#                                      predators, which have no collision
+#                                      resolution against obstacles)
+#   uint32[] obstacle_contact_ids
+#   float32  radius                 (obstacle records only; 0 for boid/predator)
+#   uint8    event                  (0 = n/a, 1 = created, 2 = removed --
+#                                    obstacle records only; 0 for boid/predator)
+#
+# Obstacle records: emitted only twice per obstacle (on creation and, if it
+# happens, on removal) rather than every step -- same as the CSV. Obstacle
+# ids are stable and never reused, assigned in creation order. The active
+# obstacle set at any step is reconstructed the same way as from the CSV:
+# by pairing each obstacle_id's "created"/"removed" event records.
 #
 # There is no fixed record length (neighbor lists vary in size), so the
 # file must be parsed sequentially from the start, reading each count
 # before its id list.
 # ---------------------------------------------------------------------------
-RECORD_HEADER_FMT = "<IBIffffBBiB"  # step, entity_type, entity_id, x, y, x_vel,
-                                    # y_vel, pre_planned, is_leader, leader_id,
-                                    # border_mode
+RECORD_HEADER_FMT = "<IBIffffBBiiBfB"  # step, entity_type, entity_id, x, y, x_vel,
+                                       # y_vel, pre_planned, is_leader, leader_id,
+                                       # waypoint_id, border_mode, radius, event
 
 ENTITY_TYPE_BOID = 0
 ENTITY_TYPE_PREDATOR = 1
+ENTITY_TYPE_OBSTACLE = 2
 BORDER_MODE_WRAP = 0
 BORDER_MODE_BOUNDED = 1
+EVENT_NA = 0
+EVENT_CREATED = 1
+EVENT_REMOVED = 2
 
 
 def pack_record(step, entity_type, entity_id, x, y, x_vel, y_vel, pre_planned,
-                 is_leader, leader_id, border_mode,
-                 separation_ids, cohesion_ids, alignment_ids, predator_ids):
-    entity_type_code = ENTITY_TYPE_BOID if entity_type == "boid" else ENTITY_TYPE_PREDATOR
+                 is_leader, leader_id, waypoint_id, border_mode,
+                 separation_ids, cohesion_ids, alignment_ids, predator_ids,
+                 obstacle_avoid_ids, obstacle_contact_ids,
+                 radius=0.0, event=None):
+    entity_type_code = {
+        "boid": ENTITY_TYPE_BOID,
+        "predator": ENTITY_TYPE_PREDATOR,
+        "obstacle": ENTITY_TYPE_OBSTACLE,
+    }[entity_type]
     border_mode_code = BORDER_MODE_WRAP if border_mode == "wrap" else BORDER_MODE_BOUNDED
+    event_code = {"created": EVENT_CREATED, "removed": EVENT_REMOVED}.get(event, EVENT_NA)
 
     data = struct.pack(
         RECORD_HEADER_FMT,
         step, entity_type_code, entity_id, x, y, x_vel, y_vel,
         1 if pre_planned else 0, 1 if is_leader else 0, leader_id,
-        border_mode_code,
+        waypoint_id, border_mode_code, radius, event_code,
     )
-    for ids in (separation_ids, cohesion_ids, alignment_ids, predator_ids):
+    for ids in (separation_ids, cohesion_ids, alignment_ids, predator_ids,
+                obstacle_avoid_ids, obstacle_contact_ids):
         data += struct.pack("<H", len(ids))
         if ids:
             data += struct.pack(f"<{len(ids)}I", *ids)
@@ -162,6 +205,11 @@ class Boid:
         self.wander_angle = random.uniform(0, 2 * math.pi)
         self.leader_id = -1          # id of the leader this boid is currently following, -1 if none
         self.predator_avoid_ids = []  # predators currently within PREDATOR_AVOID_RADIUS
+        self.obstacle_avoid_ids = []    # obstacles currently within soft avoidance range
+        self.obstacle_contact_ids = []  # obstacles currently in hard contact/overlap
+
+        self.waypoint_index = 0       # only advanced/used if this boid is a leader
+        self.target_waypoint_id = -1  # what actually gets logged -- see update()
 
     def cohesion(self, boids):
         center_x = 0
@@ -250,6 +298,30 @@ class Boid:
         self.vx += math.cos(self.wander_angle) * LEADER_WANDER_FORCE
         self.vy += math.sin(self.wander_angle) * LEADER_WANDER_FORCE
 
+    def seek_waypoint(self, waypoints):
+        """Steer toward this leader's current target waypoint. Once within
+        WAYPOINT_RADIUS of it, advance to the next one in the list (looping
+        back to the start if WAYPOINT_LOOP is on, otherwise holding at the
+        last waypoint). Only meaningful for leaders -- followers get their
+        target_waypoint_id from whichever leader they're following instead."""
+        if not waypoints:
+            return
+
+        target_x, target_y = waypoints[self.waypoint_index]
+        dx = target_x - self.x
+        dy = target_y - self.y
+        distance = (dx**2 + dy**2) ** 0.5
+
+        if distance < WAYPOINT_RADIUS:
+            if self.waypoint_index < len(waypoints) - 1:
+                self.waypoint_index += 1
+            elif WAYPOINT_LOOP:
+                self.waypoint_index = 0
+            # else: last waypoint and not looping -- just sit near it
+        else:
+            self.vx += dx * WAYPOINT_WEIGHT
+            self.vy += dy * WAYPOINT_WEIGHT
+
     def follow_leader(self, leaders):
         """Steer toward the nearest leader within LEADER_FOLLOW_RADIUS, if any."""
         nearest = None
@@ -270,8 +342,10 @@ class Boid:
             self.vx += dx * LEADER_FOLLOW_WEIGHT
             self.vy += dy * LEADER_FOLLOW_WEIGHT
             self.leader_id = nearest.id
+            self.target_waypoint_id = nearest.waypoint_index
         else:
             self.leader_id = -1
+            self.target_waypoint_id = -1
 
     def avoid_predators(self, predators):
         """Flee any predator within PREDATOR_AVOID_RADIUS. Returns the ids of
@@ -292,29 +366,42 @@ class Boid:
         return ids
 
     def avoid_obstacles(self, obstacles):
-        for ox, oy, radius in obstacles:
-            dx = self.x - ox
-            dy = self.y - oy
+        """Soft steering away from nearby obstacles. Returns the ids of
+        obstacles currently within the danger zone, for logging."""
+        ids = []
+        for obstacle in obstacles:
+            dx = self.x - obstacle.x
+            dy = self.y - obstacle.y
             distance = (dx**2 + dy**2) ** 0.5
-            danger_zone = radius + 30
+            danger_zone = obstacle.radius + 30
 
-            if distance < radius + 30:        # danger zone = radius + buffer
+            if distance < danger_zone:        # danger zone = radius + buffer
+                ids.append(obstacle.id)
                 if distance == 0:
                     distance = 0.1            # avoid dividing by zero
                 strength = (danger_zone - distance) / danger_zone
                 self.vx += (dx / distance) * strength * 2
                 self.vy += (dy / distance) * strength * 2
+        return ids
 
     def enforce_no_overlap(self, obstacles):
-        for ox, oy, radius in obstacles:
-            dx = self.x - ox
-            dy = self.y - oy
+        """Hard collision resolution -- clamp the boid to the obstacle's
+        edge if it's overlapping. Returns the ids of obstacles currently in
+        contact, for logging. This is a distinct interaction from the soft
+        steering in avoid_obstacles: a boid can be in the danger zone
+        without being in contact, but not vice versa."""
+        ids = []
+        for obstacle in obstacles:
+            dx = self.x - obstacle.x
+            dy = self.y - obstacle.y
             distance = (dx**2 + dy**2) ** 0.5
 
-            if distance < radius and distance > 0:
+            if distance < obstacle.radius and distance > 0:
                 # push the boid to sit exactly on the edge of the obstacle
-                self.x = ox + (dx / distance) * radius
-                self.y = oy + (dy / distance) * radius
+                self.x = obstacle.x + (dx / distance) * obstacle.radius
+                self.y = obstacle.y + (dy / distance) * obstacle.radius
+                ids.append(obstacle.id)
+        return ids
 
     def update(self, boids, leaders, predators, obstacles):
         self.cohesion(boids)
@@ -323,16 +410,18 @@ class Boid:
 
         if self.is_leader:
             self.leader_wander()
+            self.seek_waypoint(WAYPOINTS)
             self.leader_id = -1
+            self.target_waypoint_id = self.waypoint_index
         else:
             self.follow_leader(leaders)
 
         self.predator_avoid_ids = self.avoid_predators(predators)
-        self.avoid_obstacles(obstacles)
+        self.obstacle_avoid_ids = self.avoid_obstacles(obstacles)
         self.limit_speed(MIN_SPEED, MAX_SPEED)
         self.x += self.vx
         self.y += self.vy
-        self.enforce_no_overlap(obstacles)
+        self.obstacle_contact_ids = self.enforce_no_overlap(obstacles)
         apply_world_border(self)
 
     def draw(self, screen):
@@ -371,6 +460,7 @@ class Predator:
         self.y = random.uniform(0, WORLD_HEIGHT)
         self.vx = random.uniform(-2, 2)
         self.vy = random.uniform(-2, 2)
+        self.obstacle_avoid_ids = []  # obstacles currently within soft avoidance range
 
     def chase(self, boids):
         nearest = None
@@ -391,18 +481,23 @@ class Predator:
             self.vy += dy * PREDATOR_CHASE_WEIGHT
 
     def avoid_obstacles(self, obstacles):
-        for ox, oy, radius in obstacles:
-            dx = self.x - ox
-            dy = self.y - oy
+        """Soft steering away from nearby obstacles. Returns the ids of
+        obstacles currently within the danger zone, for logging."""
+        ids = []
+        for obstacle in obstacles:
+            dx = self.x - obstacle.x
+            dy = self.y - obstacle.y
             distance = (dx**2 + dy**2) ** 0.5
-            danger_zone = radius + 30
+            danger_zone = obstacle.radius + 30
 
             if distance < danger_zone:
+                ids.append(obstacle.id)
                 if distance == 0:
                     distance = 0.1
                 strength = (danger_zone - distance) / danger_zone
                 self.vx += (dx / distance) * strength * 2
                 self.vy += (dy / distance) * strength * 2
+        return ids
 
     def limit_speed(self, min_speed, max_speed):
         speed = (self.vx**2 + self.vy**2) ** 0.5
@@ -421,7 +516,7 @@ class Predator:
 
     def update(self, boids, obstacles):
         self.chase(boids)
-        self.avoid_obstacles(obstacles)
+        self.obstacle_avoid_ids = self.avoid_obstacles(obstacles)
         self.limit_speed(PREDATOR_MIN_SPEED, PREDATOR_MAX_SPEED)
         self.x += self.vx
         self.y += self.vy
@@ -439,6 +534,28 @@ class Predator:
         pygame.draw.polygon(screen, PREDATOR_COLOR, [tip, left, right])
 
 
+class Obstacle:
+    """A user-placed obstacle with a stable id. Ids are assigned in creation
+    order and never reused, so they stay valid as foreign keys into
+    obstacles_log.csv even after the obstacle is removed from the live
+    simulation."""
+
+    def __init__(self, obstacle_id, x, y, radius):
+        self.id = obstacle_id
+        self.x = x
+        self.y = y
+        self.radius = radius
+
+
+def draw_waypoints(screen, waypoints, font):
+    """Draw each waypoint as a numbered ring/dot so the route is visible."""
+    for i, (wx, wy) in enumerate(waypoints):
+        pygame.draw.circle(screen, WAYPOINT_RING_COLOR, (int(wx), int(wy)), WAYPOINT_RADIUS, 2)
+        pygame.draw.circle(screen, WAYPOINT_COLOR, (int(wx), int(wy)), 5)
+        label = font.render(str(i), True, (230, 230, 230))
+        screen.blit(label, (wx + 8, wy - 8))
+
+
 def log_step(step, boids, predators, csv_writer, bin_file):
     """Write one row per boid and one row per predator (CSV), and one packed
     record per entity (binary)."""
@@ -447,6 +564,8 @@ def log_step(step, boids, predators, csv_writer, bin_file):
         cohesion_ids = boid.neighbors_within(boids, COHESION_RADIUS)
         alignment_ids = boid.neighbors_within(boids, ALIGNMENT_RADIUS)
         predator_ids = boid.predator_avoid_ids
+        obstacle_avoid_ids = boid.obstacle_avoid_ids
+        obstacle_contact_ids = boid.obstacle_contact_ids
 
         csv_writer.writerow({
             "step": step,
@@ -459,17 +578,22 @@ def log_step(step, boids, predators, csv_writer, bin_file):
             "pre_planned": int(boid.pre_planned),
             "is_leader": int(boid.is_leader),
             "leader_id": boid.leader_id,
+            "waypoint_id": boid.target_waypoint_id,
             "separation": "-".join(str(i) for i in separation_ids),
             "cohesion": "-".join(str(i) for i in cohesion_ids),
             "alignment": "-".join(str(i) for i in alignment_ids),
             "predator_avoid": "-".join(str(i) for i in predator_ids),
+            "obstacle_avoid": "-".join(str(i) for i in obstacle_avoid_ids),
+            "obstacle_contact": "-".join(str(i) for i in obstacle_contact_ids),
             "border_mode": BORDER_MODE,
         })
 
         bin_file.write(pack_record(
             step, "boid", boid.id, boid.x, boid.y, boid.vx, boid.vy,
-            boid.pre_planned, boid.is_leader, boid.leader_id, BORDER_MODE,
+            boid.pre_planned, boid.is_leader, boid.leader_id,
+            boid.target_waypoint_id, BORDER_MODE,
             separation_ids, cohesion_ids, alignment_ids, predator_ids,
+            obstacle_avoid_ids, obstacle_contact_ids,
         ))
 
     for predator in predators:
@@ -484,21 +608,67 @@ def log_step(step, boids, predators, csv_writer, bin_file):
             "pre_planned": 0,
             "is_leader": 0,
             "leader_id": -1,
+            "waypoint_id": -1,
             "separation": "",
             "cohesion": "",
             "alignment": "",
             "predator_avoid": "",
+            "obstacle_avoid": "-".join(str(i) for i in predator.obstacle_avoid_ids),
+            "obstacle_contact": "",
             "border_mode": BORDER_MODE,
         })
 
         bin_file.write(pack_record(
             step, "predator", predator.id, predator.x, predator.y,
-            predator.vx, predator.vy, False, False, -1, BORDER_MODE,
+            predator.vx, predator.vy, False, False, -1, -1, BORDER_MODE,
             [], [], [], [],
+            predator.obstacle_avoid_ids, [],
         ))
 
 
-obstacles = []
+obstacles = []          # active Obstacle instances only
+next_obstacle_id = 0    # incrementing counter -- ids are never reused
+
+
+def spawn_obstacle(x, y, radius, step):
+    """Create a new obstacle, give it a stable id, and log its creation as
+    a row in the main CSV and a record in the main bin file
+    (entity_type == 'obstacle')."""
+    global next_obstacle_id
+    obstacle = Obstacle(next_obstacle_id, x, y, radius)
+    next_obstacle_id += 1
+    obstacles.append(obstacle)
+    if recording:
+        csv_writer.writerow({
+            "step": step, "entity_type": "obstacle", "entity_id": obstacle.id,
+            "x": f"{x:.4f}", "y": f"{y:.4f}", "radius": radius, "event": "created",
+        })
+        bin_file.write(pack_record(
+            step, "obstacle", obstacle.id, x, y, 0.0, 0.0,
+            False, False, -1, -1, BORDER_MODE,
+            [], [], [], [], [], [],
+            radius=radius, event="created",
+        ))
+    return obstacle
+
+
+def remove_obstacle(obstacle, step):
+    """Remove an obstacle from the live simulation and log its removal as a
+    row in the main CSV and a record in the main bin file."""
+    obstacles.remove(obstacle)
+    if recording:
+        csv_writer.writerow({
+            "step": step, "entity_type": "obstacle", "entity_id": obstacle.id,
+            "x": f"{obstacle.x:.4f}", "y": f"{obstacle.y:.4f}",
+            "radius": obstacle.radius, "event": "removed",
+        })
+        bin_file.write(pack_record(
+            step, "obstacle", obstacle.id, obstacle.x, obstacle.y, 0.0, 0.0,
+            False, False, -1, -1, BORDER_MODE,
+            [], [], [], [], [], [],
+            radius=obstacle.radius, event="removed",
+        ))
+
 
 # create 36 boids, first NUM_LEADERS of them are designated leaders
 boids = [Boid(i) for i in range(36)]
@@ -552,7 +722,8 @@ while True:
                 if event.key == pygame.K_SPACE:
                     paused = not paused
                 if event.key == pygame.K_x:
-                    obstacles.clear()
+                    for obstacle in list(obstacles):
+                        remove_obstacle(obstacle, step)
                 if event.key == pygame.K_b:
                     # toggle the world border mode live -- also affects the
                     # "border_mode" value written to the log files from now on
@@ -563,7 +734,7 @@ while True:
                 mouse_x, mouse_y = pygame.mouse.get_pos()
 
                 if event.button == 1:                    # left click
-                    obstacles.append((mouse_x, mouse_y, 40))
+                    spawn_obstacle(mouse_x, mouse_y, OBSTACLE_RADIUS, step)
 
                 elif event.button == 3:                  # right click
                     if obstacles:                         # only if there's at least one
@@ -571,20 +742,21 @@ while True:
                         closest_dist = None
 
                         for obstacle in obstacles:
-                            ox, oy, radius = obstacle
-                            dist = ((ox - mouse_x)**2 + (oy - mouse_y)**2) ** 0.5
+                            dist = ((obstacle.x - mouse_x)**2 + (obstacle.y - mouse_y)**2) ** 0.5
 
                             if closest_dist is None or dist < closest_dist:
                                 closest = obstacle
                                 closest_dist = dist
 
-                        obstacles.remove(closest)
+                        remove_obstacle(closest, step)
 
         # paints the entire window dark blue
         screen.fill((15, 20, 35))
 
-        for ox, oy, radius in obstacles:
-            pygame.draw.circle(screen, (200, 80, 80), (ox, oy), radius)
+        draw_waypoints(screen, WAYPOINTS, hud_font)
+
+        for obstacle in obstacles:
+            pygame.draw.circle(screen, (200, 80, 80), (obstacle.x, obstacle.y), obstacle.radius)
 
     if not paused:
         leaders = [b for b in boids if b.is_leader]
