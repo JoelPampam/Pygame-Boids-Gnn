@@ -4,7 +4,10 @@ import random
 import math
 import csv
 import struct
+import os
+from config import *
 
+"""
 # ---------------------------------------------------------------------------
 # Logging configuration
 # ---------------------------------------------------------------------------
@@ -75,14 +78,15 @@ BORDER_EDGE_DRAG = 0.4          # bounded mode: how much along-wall (tangential)
 WORLD_WIDTH = 900
 WORLD_HEIGHT = 650
 
-CSV_PATH = "boids_log.csv"
-BIN_PATH = "boids_log.bin"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+CSV_PATH = os.path.join(SCRIPT_DIR, "boids_log.csv")
+BIN_PATH = os.path.join(SCRIPT_DIR, "boids_log.bin")
 # How many simulation steps to record. Recording starts at step 0 and stops
 # automatically once this many steps have been logged (steps only advance
 # while unpaused, so pausing does not count against this budget).
 # 0.016 between each step
-RECORD_STEPS = 500
+RECORD_STEPS = 37500
 FPS = 60  # used only for the "elapsed time" message printed when done
 
 # If True, the whole program exits (closing the pygame window) the moment
@@ -98,7 +102,8 @@ QUIT_WHEN_RECORDING_DONE = False
 # then exits automatically the moment RECORD_STEPS have been written.
 # Use this when you only want boids_log.csv / boids_log.bin and don't care
 # about watching the simulation.
-HEADLESS_MODE = True
+HEADLESS_MODE = False
+"""
 
 CSV_FIELDS = [
     "step", "entity_type", "entity_id", "x", "y", "x_vel", "y_vel",
